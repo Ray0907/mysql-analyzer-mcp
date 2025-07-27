@@ -4,26 +4,26 @@ SQL Patch Generator for MySQL Analysis Issues
 This module generates SQL patches to fix issues identified by the various analyzers.
 """
 
-import os
 from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 
-def generate_patch_filename(db_name, patch_type="mixed"):
+def generate_patch_filename(db_name: str, patch_type: str = "mixed") -> str:
     """
     Generate a timestamped patch filename.
     
     Args:
         db_name: Name of the database
-        patch_type: Type of patch (index, schema, performance, mixed)
+        patch_type: Type of patch (e.g., index, schema, comprehensive)
         
     Returns:
-        str: Formatted filename
+        Formatted filename
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"patch_{db_name}_{patch_type}_{timestamp}.sql"
 
 
-def generate_index_patches(issues_data):
+def generate_index_patches(issues_data: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     """
     Generate SQL statements for index-related fixes.
     
@@ -53,7 +53,7 @@ def generate_index_patches(issues_data):
     return sql_statements
 
 
-def generate_schema_patches(issues_data):
+def generate_schema_patches(issues_data: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     """
     Generate SQL statements for schema-related fixes.
     
@@ -61,7 +61,7 @@ def generate_schema_patches(issues_data):
         issues_data: Dictionary of table issues from schema analyzer
         
     Returns:
-        list: List of SQL statements
+        List of SQL statements
     """
     sql_statements = []
     
@@ -95,7 +95,7 @@ def generate_schema_patches(issues_data):
     return sql_statements
 
 
-def generate_performance_patches(issues_data):
+def generate_performance_patches(issues_data: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     """
     Generate SQL statements for performance-related fixes.
     
@@ -103,7 +103,7 @@ def generate_performance_patches(issues_data):
         issues_data: Dictionary of table issues from performance analyzer
         
     Returns:
-        list: List of SQL statements
+        List of SQL statements
     """
     sql_statements = []
     
@@ -125,78 +125,59 @@ def generate_performance_patches(issues_data):
     return sql_statements
 
 
-def save_patch_file(sql_statements, filename, db_name):
-    """
-    Save SQL statements to a patch file.
-    
-    Args:
-        sql_statements: List of SQL statements
-        filename: Name of the patch file
-        db_name: Database name
-        
-    Returns:
-        str: Path to the saved file
-    """
-    if not os.path.exists('patches'):
-        os.makedirs('patches')
-    
-    filepath = os.path.join('patches', filename)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(f"-- MySQL Analysis Patch for database: {db_name}\n")
-        f.write(f"-- Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("-- WARNING: Review and test these statements before executing in production!\n\n")
-        
-        if not sql_statements:
-            f.write("-- No issues found that require SQL patches.\n")
-        else:
-            f.write("USE `" + db_name + "`;\n\n")
-            for statement in sql_statements:
-                f.write(statement + "\n\n")
-    
-    return filepath
-
-
-def generate_comprehensive_patch(index_issues, schema_issues, performance_issues, db_name):
+def generate_comprehensive_patch(
+    index_issues: Dict[str, List[Dict[str, Any]]],
+    schema_issues: Dict[str, List[Dict[str, Any]]],
+    performance_issues: Dict[str, List[Dict[str, Any]]],
+    db_name: str,
+    save_patch_function: callable,
+    workspace_dir: Optional[str] = None,
+) -> Optional[str]:
     """
     Generate a comprehensive patch file containing all fixes.
     
     Args:
         index_issues: Index analyzer results
-        schema_issues: Schema analyzer results  
+        schema_issues: Schema analyzer results
         performance_issues: Performance analyzer results
         db_name: Database name
+        save_patch_function: Function to save the patch file (e.g., from server module)
+        workspace_dir: Directory to save the patch file
         
     Returns:
-        str: Path to the generated patch file
+        Path to the generated patch file, or None if no patches were generated.
     """
     all_statements = []
     
-    # Add schema fixes first (they might affect indexes)
-    schema_statements = generate_schema_patches(schema_issues)
-    if schema_statements:
-        all_statements.append("-- ============================================")
-        all_statements.append("-- SCHEMA FIXES")
-        all_statements.append("-- ============================================")
-        all_statements.extend(schema_statements)
+    # Generate and collect patches from all analyzers
+    patch_sections = {
+        "SCHEMA": generate_schema_patches(schema_issues),
+        "INDEX": generate_index_patches(index_issues),
+        "PERFORMANCE": generate_performance_patches(performance_issues),
+    }
     
-    # Add index fixes
-    index_statements = generate_index_patches(index_issues)
-    if index_statements:
-        all_statements.append("-- ============================================")
-        all_statements.append("-- INDEX FIXES")  
-        all_statements.append("-- ============================================")
-        all_statements.extend(index_statements)
+    for section_name, statements in patch_sections.items():
+        if statements:
+            all_statements.append(f"-- ============================================")
+            all_statements.append(f"-- {section_name} FIXES")
+            all_statements.append(f"-- ============================================")
+            all_statements.extend(statements)
+            
+    if not all_statements:
+        return None
+
+    # Prepare file content
+    header = [
+        f"-- MySQL Analysis Patch for database: {db_name}",
+        f"-- Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "-- WARNING: Review and test these statements before executing in production!",
+        f"USE `{db_name}`;\n",
+    ]
     
-    # Add performance fixes last
-    performance_statements = generate_performance_patches(performance_issues)
-    if performance_statements:
-        all_statements.append("-- ============================================")
-        all_statements.append("-- PERFORMANCE FIXES")
-        all_statements.append("-- ============================================")
-        all_statements.extend(performance_statements)
+    full_content = "\n".join(header + all_statements)
     
+    # Generate filename and save the patch
     filename = generate_patch_filename(db_name, "comprehensive")
-    filepath = save_patch_file(all_statements, filename, db_name)
+    filepath = save_patch_function(full_content, filename, workspace_dir)
     
     return filepath

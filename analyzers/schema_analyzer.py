@@ -5,9 +5,15 @@ Analyzes table schema compliance with MySQL 8.0+ best practices,
 including engine, charset, constraints, and modern schema patterns.
 """
 
-import collections
 import logging
 from typing import Dict, List, Any, Optional
+
+from .utils import (
+    get_table_status,
+    get_table_indexes,
+    get_foreign_key_constraints,
+    get_table_columns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,133 +24,8 @@ RECOMMENDED_SETTINGS = {
     'collation_pattern': r'^utf8mb4_',
     'row_format': 'DYNAMIC',
     'max_int_value': 2147483647,
-    'max_bigint_value': 9223372036854775807
+    'max_bigint_value': 9223372036854775807,
 }
-
-def get_table_status(cursor, db_name: str) -> Dict[str, Dict[str, Any]]:
-    """Get comprehensive table status information."""
-    query = """
-        SELECT 
-            TABLE_NAME,
-            ENGINE,
-            TABLE_COLLATION,
-            AUTO_INCREMENT,
-            ROW_FORMAT,
-            CREATE_OPTIONS,
-            TABLE_COMMENT,
-            DATA_LENGTH,
-            INDEX_LENGTH
-        FROM information_schema.TABLES 
-        WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
-    """
-    cursor.execute(query, (db_name,))
-    
-    tables_info = {}
-    for row in cursor.fetchall():
-        table_name = row[0]
-        tables_info[table_name] = {
-            'engine': row[1],
-            'collation': row[2],
-            'auto_increment': row[3],
-            'row_format': row[4],
-            'create_options': row[5] or '',
-            'comment': row[6] or '',
-            'data_length': row[7] or 0,
-            'index_length': row[8] or 0
-        }
-    
-    return tables_info
-
-def get_table_indexes_summary(cursor, db_name: str) -> Dict[str, List[List[str]]]:
-    """Get simplified index information for constraint analysis."""
-    query = """
-        SELECT 
-            TABLE_NAME,
-            INDEX_NAME,
-            GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS COLUMNS
-        FROM information_schema.STATISTICS
-        WHERE TABLE_SCHEMA = %s
-        GROUP BY TABLE_NAME, INDEX_NAME
-    """
-    cursor.execute(query, (db_name,))
-    
-    table_indexes = collections.defaultdict(list)
-    for row in cursor.fetchall():
-        table_name, index_name, columns = row
-        column_list = columns.split(',') if columns else []
-        table_indexes[table_name].append(column_list)
-    
-    return dict(table_indexes)
-
-def get_foreign_key_constraints(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Get all foreign key constraints with detailed information."""
-    query = """
-        SELECT 
-            kcu.TABLE_NAME,
-            kcu.CONSTRAINT_NAME,
-            kcu.COLUMN_NAME,
-            kcu.REFERENCED_TABLE_NAME,
-            kcu.REFERENCED_COLUMN_NAME,
-            rc.UPDATE_RULE,
-            rc.DELETE_RULE
-        FROM information_schema.KEY_COLUMN_USAGE kcu
-        JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
-            ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
-            AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
-        WHERE kcu.TABLE_SCHEMA = %s 
-            AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
-        ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
-    """
-    cursor.execute(query, (db_name,))
-    
-    foreign_keys = collections.defaultdict(list)
-    for row in cursor.fetchall():
-        table_name, constraint_name, column_name, ref_table, ref_column, update_rule, delete_rule = row
-        foreign_keys[table_name].append({
-            'constraint_name': constraint_name,
-            'column': column_name,
-            'referenced_table': ref_table,
-            'referenced_column': ref_column,
-            'update_rule': update_rule,
-            'delete_rule': delete_rule
-        })
-    
-    return dict(foreign_keys)
-
-def get_table_columns_info(cursor, db_name: str, table_name: str) -> List[Dict[str, Any]]:
-    """Get detailed column information for a specific table."""
-    query = """
-        SELECT 
-            COLUMN_NAME,
-            DATA_TYPE,
-            IS_NULLABLE,
-            COLUMN_DEFAULT,
-            EXTRA,
-            COLUMN_KEY,
-            NUMERIC_PRECISION,
-            CHARACTER_MAXIMUM_LENGTH,
-            COLUMN_COMMENT
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-        ORDER BY ORDINAL_POSITION
-    """
-    cursor.execute(query, (db_name, table_name))
-    
-    columns = []
-    for row in cursor.fetchall():
-        columns.append({
-            'name': row[0],
-            'data_type': row[1],
-            'is_nullable': row[2],
-            'default': row[3],
-            'extra': row[4] or '',
-            'key': row[5] or '',
-            'precision': row[6],
-            'max_length': row[7],
-            'comment': row[8] or ''
-        })
-    
-    return columns
 
 def analyze_table_engine(table_name: str, table_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Analyze table storage engine compliance with modern standards."""
@@ -254,22 +135,24 @@ def analyze_auto_increment_overflow(table_name: str, table_info: Dict[str, Any],
         }
     return None
 
-def analyze_foreign_key_indexes(table_name: str, foreign_keys: List[Dict[str, Any]], 
-                               table_indexes: List[List[str]]) -> List[Dict[str, Any]]:
+def analyze_foreign_key_indexes(
+    table_name: str,
+    foreign_keys: List[Dict[str, Any]],
+    table_indexes: Dict[str, Any],
+) -> List[Dict[str, Any]]:
     """Analyze foreign key columns for missing indexes."""
     issues = []
     
+    # Create a set of the first column of all indexes for faster lookups
+    indexed_first_columns = {
+        info["columns"][0]
+        for info in table_indexes.values()
+        if info["columns"]
+    }
+
     for fk in foreign_keys:
-        fk_column = fk['column']
-        
-        # Check if foreign key column is indexed
-        is_indexed = False
-        for index_columns in table_indexes:
-            if index_columns and index_columns[0] == fk_column:
-                is_indexed = True
-                break
-        
-        if not is_indexed:
+        fk_column = fk["column"]
+        if fk_column not in indexed_first_columns:
             issues.append({
                 'type': 'CREATE_INDEX',
                 'severity': 'high',
@@ -318,74 +201,38 @@ def analyze_table_size_and_performance(table_name: str, table_info: Dict[str, An
 def analyze_schema(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Comprehensive schema analysis for MySQL 8.0+ best practices.
-    
-    Analyzes:
-    1. Storage engine compliance (InnoDB)
-    2. Charset/collation (utf8mb4)
-    3. Row format optimization
-    4. Auto-increment overflow risks
-    5. Foreign key indexing
-    6. Table size and performance
     """
     logger.info(f"Starting comprehensive schema analysis for database: {db_name}")
     
     report = {}
-    
-    # Get comprehensive table information
     tables_info = get_table_status(cursor, db_name)
-    table_indexes = get_table_indexes_summary(cursor, db_name)
     foreign_keys_info = get_foreign_key_constraints(cursor, db_name)
     
     for table_name, table_info in tables_info.items():
         table_issues = []
-        
-        # 1. Engine Analysis
-        engine_issue = analyze_table_engine(table_name, table_info)
-        if engine_issue:
-            table_issues.append(engine_issue)
-        
-        # 2. Charset/Collation Analysis
-        charset_issue = analyze_charset_collation(table_name, table_info)
-        if charset_issue:
-            table_issues.append(charset_issue)
-        
-        # 3. Row Format Analysis
-        row_format_issue = analyze_row_format(table_name, table_info)
-        if row_format_issue:
-            table_issues.append(row_format_issue)
-        
-        # 4. Auto-increment Overflow Analysis
-        columns = get_table_columns_info(cursor, db_name, table_name)
-        ai_issue = analyze_auto_increment_overflow(table_name, table_info, columns)
-        if ai_issue:
-            table_issues.append(ai_issue)
-        
-        # 5. Foreign Key Index Analysis
-        if table_name in foreign_keys_info:
-            fk_index_issues = analyze_foreign_key_indexes(
-                table_name, 
-                foreign_keys_info[table_name],
-                table_indexes.get(table_name, [])
+        columns = get_table_columns(cursor, db_name, table_name)
+        indexes = get_table_indexes(cursor, db_name, table_name)
+
+        # Run all analyses for the table
+        table_issues.extend(
+            filter(None, [
+                analyze_table_engine(table_name, table_info),
+                analyze_charset_collation(table_name, table_info),
+                analyze_row_format(table_name, table_info),
+                analyze_auto_increment_overflow(table_name, table_info, columns),
+            ])
+        )
+        table_issues.extend(
+            analyze_foreign_key_indexes(
+                table_name,
+                foreign_keys_info.get(table_name, []),
+                indexes,
             )
-            table_issues.extend(fk_index_issues)
-        
-        # 6. Table Size and Performance Analysis
-        size_issues = analyze_table_size_and_performance(table_name, table_info)
-        table_issues.extend(size_issues)
+        )
+        table_issues.extend(analyze_table_size_and_performance(table_name, table_info))
         
         if table_issues:
             report[table_name] = table_issues
-    
+            
     logger.info(f"Schema analysis completed. Analyzed {len(tables_info)} tables.")
     return report
-
-def run_schema_analysis(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Main entry point for schema analysis.
-    Returns analysis results directly for the MCP server.
-    """
-    try:
-        return analyze_schema(cursor, db_name)
-    except Exception as e:
-        logger.error(f"Error during schema analysis: {e}")
-        raise

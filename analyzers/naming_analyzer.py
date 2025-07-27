@@ -10,8 +10,10 @@ Column naming: snake_case
 
 import logging
 import collections
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Any, Optional
 import re
+
+from .utils import get_all_tables, get_table_columns, get_table_indexes
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -74,82 +76,6 @@ NAMING_CONVENTIONS = {
     }
 }
 
-def get_all_tables(cursor, db_name: str) -> List[str]:
-    """Fetch all tables from the database."""
-    cursor.execute("""
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = %s AND table_type = 'BASE TABLE'
-        ORDER BY table_name
-    """, (db_name,))
-    return [item[0] for item in cursor.fetchall()]
-
-def get_table_columns(cursor, db_name: str, table_name: str) -> List[Dict[str, Any]]:
-    """Fetch all columns for a given table with their properties."""
-    cursor.execute("""
-        SELECT 
-            column_name,
-            data_type,
-            is_nullable,
-            column_default,
-            extra,
-            column_key,
-            column_comment
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position
-    """, (db_name, table_name))
-    
-    columns = []
-    for row in cursor.fetchall():
-        columns.append({
-            'name': row[0],
-            'data_type': row[1],
-            'is_nullable': row[2],
-            'default': row[3],
-            'extra': row[4],
-            'key': row[5],
-            'comment': row[6]
-        })
-    return columns
-
-def get_table_indexes(cursor, db_name: str, table_name: str) -> Dict[str, Any]:
-    """Fetch all indexes for a given table with detailed information."""
-    cursor.execute("""
-        SELECT 
-            INDEX_NAME,
-            COLUMN_NAME,
-            NON_UNIQUE,
-            SEQ_IN_INDEX,
-            INDEX_TYPE,
-            INDEX_COMMENT
-        FROM information_schema.STATISTICS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-        ORDER BY INDEX_NAME, SEQ_IN_INDEX
-    """, (db_name, table_name))
-    
-    indexes = collections.defaultdict(lambda: {
-        'columns': [],
-        'unique': True,
-        'is_primary': False,
-        'type': 'BTREE',
-        'comment': ''
-    })
-    
-    for row in cursor.fetchall():
-        index_name, column_name, non_unique, seq_in_index, index_type, comment = row
-        
-        # Ensure columns list is long enough
-        while len(indexes[index_name]['columns']) < seq_in_index:
-            indexes[index_name]['columns'].append(None)
-        indexes[index_name]['columns'][seq_in_index - 1] = column_name
-        
-        indexes[index_name]['unique'] = (non_unique == 0)
-        indexes[index_name]['is_primary'] = (index_name == 'PRIMARY')
-        indexes[index_name]['type'] = index_type or 'BTREE'
-        indexes[index_name]['comment'] = comment or ''
-    
-    return dict(indexes)
 
 def standardize_table_name(name: str) -> str:
     """Convert a name to CamelCase format for tables."""
@@ -366,77 +292,85 @@ def analyze_naming_conventions(cursor, db_name: str) -> Dict[str, List[Dict[str,
     
     return report
 
-def generate_naming_fix_sql(issues: Dict[str, List[Dict[str, Any]]], db_name: str) -> List[str]:
+def generate_naming_fix_sql(
+    cursor, issues: Dict[str, List[Dict[str, Any]]], db_name: str
+) -> List[str]:
     """
     Generate SQL statements to fix naming convention issues.
-    
-    Args:
-        issues: Analysis report with naming issues
-        db_name: Name of the database
-        
-    Returns:
-        list: SQL statements to fix naming issues
+    This version fetches column definitions to create complete ALTER statements.
     """
-    sql_statements = []
-    sql_statements.append(f"-- Naming Convention Fixes for Database: {db_name}")
-    sql_statements.append(f"-- Generated on: {__import__('datetime').datetime.now()}")
-    sql_statements.append(f"-- Tables: CamelCase (e.g., UserProfiles)")
-    sql_statements.append(f"-- Columns: snake_case (e.g., user_id)")
-    sql_statements.append(f"-- ⚠️  IMPORTANT: Review and test these changes before applying!")
-    sql_statements.append("")
-    sql_statements.append("USE `" + db_name + "`;")
-    sql_statements.append("")
-    
-    # Group by operation type for better organization
-    table_renames = []
-    column_renames = []
-    index_renames = []
-    
+    sql_statements = [
+        f"-- Naming Convention Fixes for Database: {db_name}",
+        f"-- Generated on: {__import__('datetime').datetime.now()}",
+        "-- Conventions: Tables=CamelCase, Columns=snake_case",
+        "-- ⚠️ IMPORTANT: Review and test these changes before applying!",
+        f"\nUSE `{db_name}`;\n",
+    ]
+
+    # Fetch all column definitions once to avoid repeated queries
+    all_columns = {}
+    for table in issues.keys():
+        all_columns[table] = {
+            col["name"]: col for col in get_table_columns(cursor, db_name, table)
+        }
+
+    # Group fixes by type
+    fix_groups = collections.defaultdict(list)
     for table, table_issues in issues.items():
         for issue in table_issues:
-            if issue['type'] == 'RENAME_TABLE':
-                table_renames.append(
-                    f"-- {issue['description']}\n"
-                    f"RENAME TABLE `{issue['current_name']}` TO `{issue['suggested_name']}`;"
-                )
+            fix_groups[issue["type"]].append(issue)
+
+    # Generate SQL for each group
+    if fix_groups["RENAME_TABLE"]:
+        sql_statements.append("-- ===== TABLE RENAMES (CamelCase) =====\n")
+        for issue in fix_groups["RENAME_TABLE"]:
+            sql_statements.append(
+                f"-- {issue['description']}\n"
+                f"RENAME TABLE `{issue['current_name']}` TO `{issue['suggested_name']}`;\n"
+            )
+
+    if fix_groups["RENAME_INDEX"]:
+        sql_statements.append("-- ===== INDEX RENAMES (snake_case with prefixes) =====\n")
+        for issue in fix_groups["RENAME_INDEX"]:
+            sql_statements.append(
+                f"-- {issue['description']}\n"
+                f"ALTER TABLE `{issue['table']}` RENAME INDEX `{issue['current_name']}` TO `{issue['suggested_name']}`;\n"
+            )
+
+    if fix_groups["RENAME_COLUMN"]:
+        sql_statements.append("-- ===== COLUMN RENAMES (snake_case) =====\n")
+        for issue in fix_groups["RENAME_COLUMN"]:
+            table = issue["table"]
+            current_name = issue["current_name"]
+            suggested_name = issue["suggested_name"]
             
-            elif issue['type'] == 'RENAME_COLUMN':
-                # Note: This would require knowing the full column definition
-                column_renames.append(
-                    f"-- {issue['description']}\n"
-                    f"-- ALTER TABLE `{table}` CHANGE `{issue['current_name']}` `{issue['suggested_name']}` <COLUMN_DEFINITION>;"
+            col_def = all_columns.get(table, {}).get(current_name)
+            if not col_def:
+                sql_statements.append(
+                    f"-- COULD NOT GENERATE FIX for column '{current_name}' in table '{table}'. Definition not found.\n"
                 )
+                continue
+
+            # Reconstruct the column definition string
+            definition = f"{col_def['data_type']}"
+            if col_def["is_nullable"] == "NO":
+                definition += " NOT NULL"
+            if col_def["default"] is not None:
+                default_value = col_def["default"]
+                if isinstance(default_value, str):
+                    definition += f" DEFAULT '{default_value}'"
+                else:
+                    definition += f" DEFAULT {default_value}"
+            if col_def["extra"]:
+                definition += f" {col_def['extra']}"
+            if col_def["comment"]:
+                definition += f" COMMENT '{col_def['comment']}'"
+
+            sql_statements.append(
+                f"-- {issue['description']}\n"
+                f"ALTER TABLE `{table}` CHANGE COLUMN `{current_name}` `{suggested_name}` {definition};\n"
+            )
             
-            elif issue['type'] == 'RENAME_INDEX':
-                index_renames.append(
-                    f"-- {issue['description']}\n"
-                    f"ALTER TABLE `{table}` RENAME INDEX `{issue['current_name']}` TO `{issue['suggested_name']}`;"
-                )
-    
-    # Add sections to SQL
-    if table_renames:
-        sql_statements.append("-- ========================================")
-        sql_statements.append("-- TABLE RENAMES (CamelCase)")
-        sql_statements.append("-- ========================================")
-        sql_statements.extend(table_renames)
-        sql_statements.append("")
-    
-    if index_renames:
-        sql_statements.append("-- ========================================")
-        sql_statements.append("-- INDEX RENAMES (snake_case with prefixes)")
-        sql_statements.append("-- ========================================")
-        sql_statements.extend(index_renames)
-        sql_statements.append("")
-    
-    if column_renames:
-        sql_statements.append("-- ========================================")
-        sql_statements.append("-- COLUMN RENAMES (snake_case) - MANUAL COMPLETION REQUIRED")
-        sql_statements.append("-- ========================================")
-        sql_statements.append("-- Note: Column renames require full column definitions.")
-        sql_statements.append("-- Please complete these statements with proper data types.")
-        sql_statements.extend(column_renames)
-        sql_statements.append("")
-    
     return sql_statements
 
 def run_naming_analysis(cursor, db_name: str) -> Dict[str, Any]:

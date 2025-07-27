@@ -68,20 +68,26 @@ This server provides a suite of tools to analyze and improve your MySQL database
 
 ## 🏗️ Project Structure
 
-```
-mysql_analize/
-├── src/mysql_analyzer_mcp/
+```bash
+mysql-analyzer-mcp/
+├── src/
+│   └── mysql_analyzer_mcp/
+│       ├── __init__.py
+│       └── server.py              # Main MCP server logic using the official MCP SDK
+├── analyzers/
 │   ├── __init__.py
-│   └── server.py              # Main MCP server
-├── analyzers/                 # Analysis modules
 │   ├── naming_analyzer.py
 │   ├── index_analyzer.py
 │   ├── schema_analyzer.py
-│   └── performance_analyzer.py
-├── build.sh                   # Build and setup script
-├── pyproject.toml             # Package configuration
-├── requirements.txt           # Dependencies
-└── .env.example               # Environment template
+│   ├── performance_analyzer.py
+│   └── utils.py                 # Shared database utility functions
+├── build.sh                       # Build and setup script
+├── config.py                      # Centralized configuration management
+├── db_connector.py                # Database connection handling
+├── patch_generator.py             # SQL patch generation logic
+├── pyproject.toml                 # Package configuration
+├── requirements.txt               # Dependencies
+└── .env.example                   # Environment template
 ```
 
 ## 🔧 Configuration

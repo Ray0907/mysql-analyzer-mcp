@@ -1,73 +1,63 @@
 
-def analyze_performance(cursor, db_name):
+import logging
+from typing import Dict, List, Any
+
+logger = logging.getLogger(__name__)
+
+def analyze_performance(
+    cursor,
+    db_name: str,
+    min_rows_for_unused_index: int = 1000,
+    fragmentation_threshold_mb: int = 10,
+    fragmentation_ratio: float = 0.2,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Analyzes performance-related metrics.
-    Checks for: Unused indexes and table fragmentation.
-    
-    NOTE: Unused index check requires performance_schema to be enabled and the
-    server to have been running for a significant time to gather meaningful data.
+    Analyzes performance-related metrics, such as unused indexes and table fragmentation.
     """
     report = {}
-    
-    # --- 1. Unused Indexes Check ---
-    # This query checks for indexes that have never been used.
-    query_unused_indexes = """
-        SELECT 
-            s.TABLE_NAME, 
-            s.INDEX_NAME
-        FROM information_schema.STATISTICS s
-        LEFT JOIN information_schema.TABLE_STATISTICS ts ON s.TABLE_SCHEMA = ts.TABLE_SCHEMA AND s.TABLE_NAME = ts.TABLE_NAME
-        LEFT JOIN performance_schema.table_io_waits_summary_by_index_usage p ON s.TABLE_SCHEMA = p.OBJECT_SCHEMA AND s.TABLE_NAME = p.OBJECT_NAME AND s.INDEX_NAME = p.INDEX_NAME
-        WHERE s.TABLE_SCHEMA = %s
-          AND s.INDEX_NAME != 'PRIMARY'
-          AND (p.COUNT_FETCH IS NULL OR p.COUNT_FETCH = 0)
-          AND ts.ROWS_READ > 1000; -- Only consider tables with some activity
-    """
+
+    # 1. Unused Indexes Check
     try:
-        cursor.execute("SET @db_name = %s", (db_name,))
-        cursor.execute(query_unused_indexes, (db_name,))
-        
-        for row in cursor.fetchall():
-            table, index = row
-            if table not in report:
-                report[table] = []
-            
-            report[table].append({
+        query_unused_indexes = """
+            SELECT s.TABLE_NAME, s.INDEX_NAME
+            FROM information_schema.STATISTICS s
+            LEFT JOIN performance_schema.table_io_waits_summary_by_index_usage p 
+                ON s.TABLE_SCHEMA = p.OBJECT_SCHEMA 
+                AND s.TABLE_NAME = p.OBJECT_NAME 
+                AND s.INDEX_NAME = p.INDEX_NAME
+            WHERE s.TABLE_SCHEMA = %s
+              AND s.INDEX_NAME != 'PRIMARY'
+              AND (p.COUNT_FETCH IS NULL OR p.COUNT_FETCH = 0)
+              AND (SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = s.TABLE_SCHEMA AND TABLE_NAME = s.TABLE_NAME) > %s
+        """
+        cursor.execute(query_unused_indexes, (db_name, min_rows_for_unused_index))
+        for table, index in cursor.fetchall():
+            report.setdefault(table, []).append({
                 'type': 'DROP_INDEX',
                 'severity': 'medium',
                 'description': f"Index '{index}' appears to be unused. (Requires performance_schema and long uptime for accuracy).",
-                'data': {'table': table, 'index_name': index}
+                'data': {'table': table, 'index_name': index},
             })
     except Exception as e:
-        # This can fail if performance_schema is not enabled.
-        print(f"\n[Warning] Could not run unused index check. Error: {e}")
-        print("Please ensure performance_schema is enabled and the user has appropriate permissions.")
+        logger.warning(f"Could not run unused index check (this is expected if performance_schema is disabled): {e}")
 
-
-    # --- 2. Table Fragmentation Check ---
-    query_fragmentation = """
-        SELECT 
-            TABLE_NAME,
-            DATA_LENGTH,
-            DATA_FREE
-        FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = %s AND DATA_FREE > 0;
-    """
-    cursor.execute(query_fragmentation, (db_name,))
-    
-    for row in cursor.fetchall():
-        table, data_length, data_free = row
-        
-        # Warn if fragmentation is more than 20% of the table's data size, and is significant (> 10MB)
-        if data_length > 0 and data_free > 10 * 1024 * 1024 and (data_free / data_length) > 0.2:
-            if table not in report:
-                report[table] = []
-            
-            report[table].append({
-                'type': 'OPTIMIZE_TABLE',
-                'severity': 'low',
-                'description': f"Table has significant fragmentation ({data_free / 1024 / 1024:.2f} MB free). Consider running OPTIMIZE TABLE.",
-                'data': {'table': table}
-            })
+    # 2. Table Fragmentation Check
+    try:
+        query_fragmentation = """
+            SELECT TABLE_NAME, DATA_LENGTH, DATA_FREE
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = %s AND DATA_FREE > %s;
+        """
+        cursor.execute(query_fragmentation, (db_name, fragmentation_threshold_mb * 1024 * 1024))
+        for table, data_length, data_free in cursor.fetchall():
+            if data_length > 0 and (data_free / data_length) > fragmentation_ratio:
+                report.setdefault(table, []).append({
+                    'type': 'OPTIMIZE_TABLE',
+                    'severity': 'low',
+                    'description': f"Table has significant fragmentation ({data_free / 1024 / 1024:.2f} MB free). Consider running OPTIMIZE TABLE.",
+                    'data': {'table': table},
+                })
+    except Exception as e:
+        logger.error(f"Could not run table fragmentation check: {e}")
 
     return report

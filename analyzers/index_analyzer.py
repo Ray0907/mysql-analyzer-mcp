@@ -5,66 +5,12 @@ Analyzes index naming conventions, redundancy, and performance issues
 following MySQL 8.0+ best practices and latest naming conventions.
 """
 
-import collections
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
+
+from .utils import get_all_tables, get_table_indexes
 
 logger = logging.getLogger(__name__)
-
-def get_all_tables(cursor, db_name: str) -> List[str]:
-    """Fetch all tables from the database."""
-    cursor.execute("""
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = %s AND table_type = 'BASE TABLE'
-        ORDER BY table_name
-    """, (db_name,))
-    return [item[0] for item in cursor.fetchall()]
-
-def get_table_indexes(cursor, db_name: str, table_name: str) -> Dict[str, Any]:
-    """Fetch all indexes for a given table, including column order and uniqueness."""
-    query = """
-        SELECT 
-            INDEX_NAME, 
-            COLUMN_NAME, 
-            NON_UNIQUE,
-            SEQ_IN_INDEX,
-            INDEX_TYPE,
-            INDEX_COMMENT,
-            CARDINALITY
-        FROM information_schema.STATISTICS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-        ORDER BY INDEX_NAME, SEQ_IN_INDEX
-    """
-    cursor.execute(query, (db_name, table_name))
-    
-    indexes = collections.defaultdict(lambda: {
-        'columns': [], 
-        'unique': True, 
-        'is_primary': False,
-        'type': 'BTREE',
-        'comment': '',
-        'cardinality': []
-    })
-    
-    rows = cursor.fetchall()
-    for row in rows:
-        index_name, column_name, non_unique, seq_in_index, index_type, comment, cardinality = row
-        
-        # Store columns in correct order
-        while len(indexes[index_name]['columns']) < seq_in_index:
-            indexes[index_name]['columns'].append(None)
-            indexes[index_name]['cardinality'].append(None)
-            
-        indexes[index_name]['columns'][seq_in_index - 1] = column_name
-        indexes[index_name]['cardinality'][seq_in_index - 1] = cardinality or 0
-
-        indexes[index_name]['unique'] = (non_unique == 0)
-        indexes[index_name]['is_primary'] = (index_name == 'PRIMARY')
-        indexes[index_name]['type'] = index_type or 'BTREE'
-        indexes[index_name]['comment'] = comment or ''
-
-    return dict(indexes)
 
 def analyze_index_naming_conventions(table: str, indexes: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -177,19 +123,16 @@ def analyze_index_redundancy(table: str, indexes: Dict[str, Any]) -> List[Dict[s
     
     return issues
 
-def analyze_index_performance(table: str, indexes: Dict[str, Any], cursor, db_name: str) -> List[Dict[str, Any]]:
+def analyze_index_performance(
+    table: str,
+    indexes: Dict[str, Any],
+    table_rows: int,
+) -> List[Dict[str, Any]]:
     """
-    Analyze index performance issues including low cardinality and unused indexes.
+    Analyze index performance issues including low cardinality.
     """
     issues = []
-    
-    # Get table row count for cardinality analysis
-    try:
-        cursor.execute(f"SELECT COUNT(*) FROM `{db_name}`.`{table}`")
-        table_rows = cursor.fetchone()[0]
-    except Exception:
-        table_rows = 0
-    
+
     for name, info in indexes.items():
         if name == 'PRIMARY':
             continue
@@ -221,13 +164,6 @@ def analyze_index_performance(table: str, indexes: Dict[str, Any], cursor, db_na
 def analyze_indexes(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Comprehensive index analysis with latest MySQL 8.0+ standards.
-    
-    Analyzes:
-    1. Naming convention compliance
-    2. Index redundancy
-    3. Performance issues (low cardinality, unused indexes)
-    
-    Returns detailed report for patch generation.
     """
     logger.info(f"Starting comprehensive index analysis for database: {db_name}")
     
@@ -235,20 +171,19 @@ def analyze_indexes(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
     tables = get_all_tables(cursor, db_name)
     
     for table in tables:
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM `{db_name}`.`{table}`")
+            table_rows = cursor.fetchone()[0]
+        except Exception:
+            table_rows = 0
+            
         table_issues = []
         indexes = get_table_indexes(cursor, db_name, table)
         
-        # 1. Naming Convention Analysis
-        naming_issues = analyze_index_naming_conventions(table, indexes)
-        table_issues.extend(naming_issues)
-        
-        # 2. Redundancy Analysis
-        redundancy_issues = analyze_index_redundancy(table, indexes)
-        table_issues.extend(redundancy_issues)
-        
-        # 3. Performance Analysis
-        performance_issues = analyze_index_performance(table, indexes, cursor, db_name)
-        table_issues.extend(performance_issues)
+        # Run all analyses for the table
+        table_issues.extend(analyze_index_naming_conventions(table, indexes))
+        table_issues.extend(analyze_index_redundancy(table, indexes))
+        table_issues.extend(analyze_index_performance(table, indexes, table_rows))
         
         if table_issues:
             # Remove duplicate drop recommendations
@@ -271,37 +206,10 @@ def analyze_indexes(cursor, db_name: str) -> Dict[str, List[Dict[str, Any]]]:
 
 def run_index_analysis(cursor, db_name: str) -> Dict[str, Any]:
     """
-    Main entry point for index analysis with formatted report structure.
-    
-    Returns a report compatible with the existing MCP server structure.
+    Main entry point for index analysis.
     """
     try:
-        analysis_result = analyze_indexes(cursor, db_name)
-        
-        # Format the result to match the expected report structure in mcp.py
-        formatted_report = {}
-        
-        for table, issues in analysis_result.items():
-            table_report = {
-                'naming_issues': [],
-                'redundant_indexes': [],
-                'performance_issues': []
-            }
-            
-            for issue in issues:
-                if issue['type'] == 'RENAME_INDEX':
-                    table_report['naming_issues'].append(issue['description'])
-                elif issue['type'] == 'DROP_INDEX':
-                    table_report['redundant_indexes'].append(issue['description'])
-                elif issue['type'] == 'LOW_CARDINALITY_INDEX':
-                    table_report['performance_issues'].append(issue['description'])
-            
-            # Only include tables that have issues
-            if any([table_report['naming_issues'], table_report['redundant_indexes'], table_report['performance_issues']]):
-                formatted_report[table] = table_report
-        
-        return formatted_report
-        
+        return analyze_indexes(cursor, db_name)
     except Exception as e:
         logger.error(f"Error during index analysis: {e}")
         raise

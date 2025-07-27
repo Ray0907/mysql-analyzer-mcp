@@ -11,153 +11,74 @@ Following the official MCP Python SDK patterns from https://modelcontextprotocol
 """
 
 import asyncio
-import json
 import sys
-import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from datetime import datetime
 
-# Add the project root to Python path for development
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+# Add project root to Python path
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-# MCP SDK imports - following official patterns
+# MCP SDK imports
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
+import mcp.server.stdio as stdio
 from mcp.server.models import InitializationOptions
-import mcp.server.stdio
 
-# Database analyzers - robust import handling
-# Multiple fallback strategies to ensure imports work in different environments
-
-def import_analyzers():
-    """Import analyzer modules with multiple fallback strategies."""
-    import importlib.util
-    
-    # Strategy 1: Standard package import
-    try:
-        import db_connector
-        from analyzers import index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer
-        import patch_generator
-        logger.info("✅ Standard import successful")
-        return db_connector, index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer, patch_generator
-    except ImportError as e:
-        logger.warning(f"Standard import failed: {e}")
-    
-    # Strategy 2: Add parent directories to path
-    try:
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        import db_connector
-        from analyzers import index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer
-        import patch_generator
-        logger.info("✅ Parent path import successful")
-        return db_connector, index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer, patch_generator
-    except ImportError as e:
-        logger.warning(f"Parent path import failed: {e}")
-    
-    # Strategy 3: Direct analyzer directory import
-    try:
-        analyzers_path = project_root / "analyzers"
-        sys.path.insert(0, str(analyzers_path))
-        sys.path.insert(0, str(project_root))
-        
-        import naming_analyzer
-        import index_analyzer
-        import performance_analyzer
-        import schema_analyzer
-        import db_connector
-        import patch_generator
-        logger.info("✅ Direct import successful")
-        return db_connector, index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer, patch_generator
-    except ImportError as e:
-        logger.warning(f"Direct import failed: {e}")
-    
-    # Strategy 4: Importlib with absolute paths
-    try:
-        modules = {}
-        module_paths = {
-            'naming_analyzer': project_root / "analyzers" / "naming_analyzer.py",
-            'index_analyzer': project_root / "analyzers" / "index_analyzer.py",
-            'performance_analyzer': project_root / "analyzers" / "performance_analyzer.py",
-            'schema_analyzer': project_root / "analyzers" / "schema_analyzer.py",
-            'db_connector': project_root / "db_connector.py",
-            'patch_generator': project_root / "patch_generator.py"
-        }
-        
-        for module_name, module_path in module_paths.items():
-            if module_path.exists():
-                spec = importlib.util.spec_from_file_location(module_name, module_path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                modules[module_name] = module
-                logger.info(f"✅ Imported {module_name} via importlib")
-            else:
-                logger.error(f"❌ Module file not found: {module_path}")
-                raise ImportError(f"Module file not found: {module_path}")
-        
-        return (modules['db_connector'], modules['index_analyzer'], 
-                modules['performance_analyzer'], modules['schema_analyzer'], 
-                modules['naming_analyzer'], modules['patch_generator'])
-    
-    except Exception as e:
-        logger.error(f"All import strategies failed: {e}")
-        raise ImportError(f"Could not import required modules: {e}")
-
-# Import the modules
+# Local imports
 try:
-    db_connector, index_analyzer, performance_analyzer, schema_analyzer, naming_analyzer, patch_generator = import_analyzers()
-    logger.info("🎉 All analyzer modules imported successfully")
+    from config import get_config
+    import db_connector
+    from analyzers import (
+        index_analyzer,
+        naming_analyzer,
+        performance_analyzer,
+        schema_analyzer,
+    )
+    import patch_generator
 except ImportError as e:
-    logger.error(f"❌ Failed to import analyzer modules: {e}")
+    # Add a more helpful error message for debugging
+    logging.basicConfig(level=logging.DEBUG)
+    logging.error(
+        f"Failed to import local modules: {e}\n"
+        f"Python Path: {sys.path}\n"
+        f"Current Directory: {Path.cwd()}"
+    )
     raise
 
-# Configure logging (MCP servers should write to stderr, not stdout)
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stderr)]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("mysql-analyzer-mcp")
-
-# Test imports immediately
-logger.info("🔧 Testing module imports...")
-try:
-    # Quick test to ensure naming_analyzer is working
-    test_result = naming_analyzer.standardize_table_name("test_table")
-    logger.info(f"✅ naming_analyzer test: 'test_table' → '{test_result}'")
-except Exception as e:
-    logger.error(f"❌ naming_analyzer test failed: {e}")
-    raise
 
 # Create the server instance following MCP patterns
 server = Server("mysql-analyzer-mcp")
 
-# Helper functions for database operations
-async def get_database_connection(arguments: Dict[str, Any]):
-    """Get database connection using provided arguments or .env defaults."""
+# Helper functions
+async def get_database_connection(arguments: Dict[str, Any]) -> tuple:
+    """
+    Get database connection using provided arguments or configuration.
+    Overrides default config with any provided arguments.
+    """
+    config_manager = get_config()
+    
+    # Override config with arguments if provided
+    db_config = config_manager.override_db_config(**arguments)
+
+    if not db_config.is_valid():
+        raise ValueError("Database configuration is incomplete. Please provide credentials or set up your .env file.")
+
     try:
-        if any(k in arguments for k in ['db_host', 'db_user', 'db_password', 'db_database']):
-            # Use provided credentials
-            import mysql.connector
-            connection = mysql.connector.connect(
-                host=arguments.get('db_host', 'localhost'),
-                user=arguments.get('db_user'),
-                password=arguments.get('db_password'),
-                database=arguments.get('db_database')
-            )
-            db_name = arguments.get('db_database')
-        else:
-            # Use .env file
-            connection = db_connector.get_db_connection()
-            db_name = db_connector.get_db_name()
-        
+        connection = db_connector.get_db_connection()
         if not connection or not connection.is_connected():
-            raise Exception("Failed to establish database connection")
-        
-        return connection, db_name
+            raise ConnectionError("Failed to establish database connection.")
+        return connection, db_config.database
     except Exception as e:
         logger.error(f"Database connection error: {e}")
         raise
@@ -353,7 +274,7 @@ async def tool_analyze_naming_conventions(arguments: Dict[str, Any]) -> str:
         workspace_dir = arguments.get("workspace_dir")
         
         if fix_issues and analysis_result.get('issues'):
-            sql_fixes = naming_analyzer.generate_naming_fix_sql(analysis_result['issues'], db_name)
+            sql_fixes = naming_analyzer.generate_naming_fix_sql(cursor, analysis_result['issues'], db_name)
             
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"naming_fixes_{db_name}_{timestamp}.sql"
@@ -393,20 +314,25 @@ async def tool_analyze_database_indexes(arguments: Dict[str, Any]) -> str:
         for table, issues in index_report.items():
             result.append(f"### Table: `{table}`")
             
-            if issues.get('naming_issues'):
+            # Group issues by type for better readability
+            naming_issues = [i for i in issues if i['type'] == 'RENAME_INDEX']
+            redundancy_issues = [i for i in issues if i['type'] == 'DROP_INDEX']
+            performance_issues = [i for i in issues if i['type'] == 'LOW_CARDINALITY_INDEX']
+
+            if naming_issues:
                 result.append("\n**🏷️ Index Naming Issues:**")
-                for issue in issues['naming_issues']:
-                    result.append(f"- {issue}")
+                for issue in naming_issues:
+                    result.append(f"- {issue['description']}")
             
-            if issues.get('redundant_indexes'):
+            if redundancy_issues:
                 result.append("\n**🔄 Redundant Indexes:**")
-                for issue in issues['redundant_indexes']:
-                    result.append(f"- {issue}")
+                for issue in redundancy_issues:
+                    result.append(f"- {issue['description']}")
             
-            if issues.get('performance_issues'):
+            if performance_issues:
                 result.append("\n**⚡ Performance Issues:**")
-                for issue in issues['performance_issues']:
-                    result.append(f"- {issue}")
+                for issue in performance_issues:
+                    result.append(f"- {issue['description']}")
             
             result.append("")
         
@@ -439,8 +365,8 @@ async def tool_analyze_database_performance(arguments: Dict[str, Any]) -> str:
             result.append(f"### Table: `{table}`")
             
             for issue in issues:
-                severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(issue['severity'], "ℹ️")
-                result.append(f"{severity_emoji} **{issue['severity'].upper()}**: {issue['description']}")
+                severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(issue.get('severity', 'low'), "ℹ️")
+                result.append(f"{severity_emoji} **{issue.get('severity', 'low').upper()}**: {issue.get('description')}")
             
             result.append("")
         
@@ -473,8 +399,8 @@ async def tool_analyze_database_schema(arguments: Dict[str, Any]) -> str:
             result.append(f"### Table: `{table}`")
             
             for issue in issues:
-                severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(issue['severity'], "ℹ️")
-                result.append(f"{severity_emoji} **{issue['severity'].upper()}**: {issue['description']}")
+                severity_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(issue.get('severity', 'low'), "ℹ️")
+                result.append(f"{severity_emoji} **{issue.get('severity', 'low').upper()}**: {issue.get('description')}")
             
             result.append("")
         
@@ -554,12 +480,28 @@ async def tool_comprehensive_analysis(arguments: Dict[str, Any]) -> str:
             result.append("## 📊 Index Analysis")
             for table, issues in index_report.items():
                 result.append(f"### Table: `{table}`")
-                for issue_type, issue_list in issues.items():
-                    if issue_list:
-                        result.append(f"**{issue_type.replace('_', ' ').title()}:**")
-                        for issue in issue_list:
-                            result.append(f"- {issue}")
-            result.append("")
+                
+                # Group issues by type for better readability
+                naming_issues = [i for i in issues if i['type'] == 'RENAME_INDEX']
+                redundancy_issues = [i for i in issues if i['type'] == 'DROP_INDEX']
+                performance_issues = [i for i in issues if i['type'] == 'LOW_CARDINALITY_INDEX']
+
+                if naming_issues:
+                    result.append("\n**🏷️ Index Naming Issues:**")
+                    for issue in naming_issues:
+                        result.append(f"- {issue['description']}")
+                
+                if redundancy_issues:
+                    result.append("\n**🔄 Redundant Indexes:**")
+                    for issue in redundancy_issues:
+                        result.append(f"- {issue['description']}")
+                
+                if performance_issues:
+                    result.append("\n**⚡ Performance Issues:**")
+                    for issue in performance_issues:
+                        result.append(f"- {issue['description']}")
+                
+                result.append("")
         
         # Generate patches if requested
         generate_patches = arguments.get("generate_patches", True)
@@ -570,7 +512,7 @@ async def tool_comprehensive_analysis(arguments: Dict[str, Any]) -> str:
             
             # Generate naming patches
             if naming_analysis.get('issues'):
-                naming_fixes = naming_analyzer.generate_naming_fix_sql(naming_analysis['issues'], db_name)
+                naming_fixes = naming_analyzer.generate_naming_fix_sql(cursor, naming_analysis['issues'], db_name)
                 naming_file = f"naming_fixes_{db_name}_{timestamp}.sql"
                 naming_path = save_patch_file('\n'.join(naming_fixes), naming_file, workspace_dir)
                 
@@ -617,7 +559,7 @@ async def tool_generate_sql_patches(arguments: Dict[str, Any]) -> str:
             if not naming_analysis.get('issues'):
                 return "✅ No naming issues found - no patches needed!"
             
-            sql_fixes = naming_analyzer.generate_naming_fix_sql(naming_analysis['issues'], db_name)
+            sql_fixes = naming_analyzer.generate_naming_fix_sql(cursor, naming_analysis['issues'], db_name)
             filename = f"naming_fixes_{db_name}_{timestamp}.sql"
             filepath = save_patch_file('\n'.join(sql_fixes), filename, workspace_dir)
             
@@ -635,7 +577,7 @@ async def tool_generate_sql_patches(arguments: Dict[str, Any]) -> str:
             all_patches = []
             
             if naming_analysis.get('issues'):
-                naming_fixes = naming_analyzer.generate_naming_fix_sql(naming_analysis['issues'], db_name)
+                naming_fixes = naming_analyzer.generate_naming_fix_sql(cursor, naming_analysis['issues'], db_name)
                 all_patches.extend(naming_fixes)
             
             filename = f"comprehensive_fixes_{db_name}_{timestamp}.sql"
@@ -673,7 +615,7 @@ async def main():
     logger.info("📖 Following Model Context Protocol patterns")
     
     # Use stdin/stdout streams for MCP communication
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+    async with stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
