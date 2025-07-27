@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mysql-analyzer": {
+      "command": ".venv/bin/python",
+      "args": ["src/mysql_analyzer_mcp/server.py"],
+      "env": {}
+    }
+  }
+}
