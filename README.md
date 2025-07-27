@@ -1,6 +1,6 @@
 # MySQL Analyzer MCP Server
 
-A **Model Context Protocol (MCP)** server for comprehensive MySQL database analysis with enforced naming conventions.
+A standalone Model Context Protocol (MCP) server providing a suite of tools for static analysis of MySQL databases, focusing on schema integrity, naming conventions, and performance metrics.
 
 ## 🏷️ Naming Conventions
 
